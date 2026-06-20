@@ -1,0 +1,14 @@
+{
+  "name": "duplicate_finder",
+  "version": "0.1.0",
+  "description": "Duplicate Finder Electron app",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "echo \"No tests\" && exit 0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^42.4.1"
+  }
+}
