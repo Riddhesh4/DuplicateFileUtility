@@ -53,3 +53,37 @@ def test_perceptual_duplicates(tmp_path):
     groups = scanner.find_duplicates([str(tmp_path)], workers=2)
 
     assert any(g["type"] == "perceptual" and len(g["files"]) >= 2 for g in groups)
+
+
+def test_scan_cache_reuse(tmp_path, monkeypatch):
+    d = tmp_path / "cache"
+    d.mkdir()
+    f1 = d / "file1.bin"
+    f2 = d / "file2.bin"
+    f1.write_bytes(b"hello world")
+    f2.write_bytes(b"hello world")
+    cache_db = tmp_path / "scanner_cache.db"
+
+    # initial scan populates the cache file
+    groups = scanner.find_duplicates([str(d)], workers=1, cache_path=str(cache_db))
+    assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)
+    assert cache_db.exists()
+
+    # second scan should reuse cached hashes without recomputing them
+    called = {"partial": 0, "full": 0}
+
+    def fake_partial(path):
+        called["partial"] += 1
+        return scanner._compute_partial_hash(path)
+
+    def fake_full(path):
+        called["full"] += 1
+        return scanner._compute_full_hash_worker(path)
+
+    monkeypatch.setattr(scanner, "_compute_partial_hash", fake_partial)
+    monkeypatch.setattr(scanner, "_compute_full_hash_worker", fake_full)
+
+    groups = scanner.find_duplicates([str(d)], workers=1, cache_path=str(cache_db))
+    assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)
+    assert called["partial"] == 0
+    assert called["full"] == 0
