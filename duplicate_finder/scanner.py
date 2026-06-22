@@ -17,24 +17,52 @@ from collections import defaultdict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import mmap
-from typing import List, Optional, Callable, Dict, Any
+from typing import List, Optional, Callable, Dict, Any, TypedDict, Literal, Union, Protocol, cast, TYPE_CHECKING
 
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except Exception:
-    PIL_AVAILABLE = False
+# Check optional dependencies (use functions to avoid Pylance "constant reassignment" error)
+def _check_pil_available() -> bool:
+    try:
+        from PIL import Image
+        return True
+    except Exception:
+        return False
 
+def _check_imagehash_available() -> bool:
+    try:
+        import imagehash
+        return True
+    except Exception:
+        return False
+
+def _check_xxhash_available() -> bool:
+    try:
+        import xxhash
+        return True
+    except Exception:
+        return False
+
+PIL_AVAILABLE = _check_pil_available()
+IMAGEHASH_AVAILABLE = _check_imagehash_available()
+XXHASH_AVAILABLE = _check_xxhash_available()
+
+# Perform actual imports for runtime use (imagehash and xxhash only; PIL.Image imported locally in functions)
 try:
     import imagehash
-    IMAGEHASH_AVAILABLE = True
 except Exception:
-    IMAGEHASH_AVAILABLE = False
+    pass
+
 try:
     import xxhash
-    XXHASH_AVAILABLE = True
 except Exception:
-    XXHASH_AVAILABLE = False
+    pass
+
+if TYPE_CHECKING:
+    # For Pylance: ensure xxhash types are visible during type checking
+    try:
+        import xxhash as xxhash_for_types
+    except Exception:
+        xxhash_for_types = None  # type: ignore[assignment]
+
 
 CHUNK_SIZE = 8 * 1024 * 1024
 PARTIAL_READ = 256 * 1024
@@ -50,6 +78,18 @@ IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
 PHASH_HAMMING_THRESHOLD = 10
 
 logger = logging.getLogger("duplicate_finder.scanner")
+
+
+class HashAlgorithm(Protocol):
+    """Protocol for hash algorithm objects (hashlib, xxhash, etc.)."""
+
+    def update(self, __data: bytes, /) -> None:
+        """Update the hash with data (position-only parameter)."""
+        ...
+
+    def hexdigest(self) -> str:
+        """Return the digest as a hex string."""
+        ...
 
 
 class HashCache:
@@ -81,19 +121,17 @@ class HashCache:
             pass
         self.conn.close()
 
-    def get_records(self, paths: List[str]) -> Dict[str, dict]:
+    def get_records(self, paths: List[str]) -> Dict[str, CacheRecord]:
         if not paths:
             return {}
 
-        records: Dict[str, dict] = {}
+        records: Dict[str, CacheRecord] = {}
         batch_size = 500
         for start in range(0, len(paths), batch_size):
             batch = paths[start : start + batch_size]
             placeholders = ",".join("?" for _ in batch)
-            cursor = self.conn.execute(
-                f"SELECT path,size,mtime,partial_hash,full_hash,phash,width,height FROM file_hashes WHERE path IN ({placeholders})",
-                batch,
-            )
+            query = "SELECT path,size,mtime,partial_hash,full_hash,phash,width,height FROM file_hashes WHERE path IN (" + placeholders + ")"
+            cursor = self.conn.execute(query, batch)
             for row in cursor.fetchall():
                 records[row[0]] = {
                     "size": row[1],
@@ -141,6 +179,43 @@ class HashCache:
         )
 
 
+class DuplicateGroup(TypedDict):
+    type: str
+    hash: Optional[str]
+    files: List["FileEntry"]
+    suggested: int
+
+
+class CacheRecord(TypedDict, total=False):
+    size: int
+    mtime: float
+    partial_hash: Optional[str]
+    full_hash: Optional[str]
+    phash: Optional[str]
+    width: Optional[int]
+    height: Optional[int]
+
+
+class ProgressStatus(TypedDict):
+    type: Literal["status"]
+    text: str
+
+
+class ProgressTotal(TypedDict):
+    type: Literal["total"]
+    total: int
+
+
+class ProgressFile(TypedDict):
+    type: Literal["file"]
+    stage: str
+    path: str
+
+
+ProgressMessage = Union[ProgressStatus, ProgressTotal, ProgressFile, Dict[str, Any]]
+ProgressCallback = Callable[[ProgressMessage], None]
+
+
 @dataclass
 class FileEntry:
     path: str
@@ -159,6 +234,7 @@ def _is_image_file(path: str) -> bool:
     if not PIL_AVAILABLE:
         return False
     try:
+        from PIL import Image
         with Image.open(path) as im:
             im.verify()
         return True
@@ -166,8 +242,8 @@ def _is_image_file(path: str) -> bool:
         return False
 
 
-def _apply_cache_to_entry(entry: FileEntry, record: dict) -> None:
-    if record["size"] != entry.size or record["mtime"] != entry.mtime:
+def _apply_cache_to_entry(entry: FileEntry, record: CacheRecord) -> None:
+    if record.get("size") != entry.size or record.get("mtime") != entry.mtime:
         return
     entry.partial_hash = record.get("partial_hash")
     entry.full_hash = record.get("full_hash")
@@ -189,18 +265,6 @@ def _compute_partial_hash(path: str) -> Optional[str]:
         return h.hexdigest()
     except Exception:
         logger.exception("Partial hash failed for %s", path)
-        return None
-
-
-def _compute_full_hash(path: str) -> Optional[str]:
-    h = hashlib.sha256()
-    try:
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        logger.exception("Full hash failed for %s", path)
         return None
 
 
@@ -235,9 +299,10 @@ def _compute_fast_hash_worker(path: str) -> Optional[str]:
     """Compute a fast fingerprint for a file, preferring xxhash when available."""
     try:
         if XXHASH_AVAILABLE:
-            h = xxhash.xxh64()
+            assert XXHASH_AVAILABLE, "xxhash must be available"  # type guard
+            h = cast(HashAlgorithm, xxhash.xxh64())
         else:
-            h = hashlib.sha256()
+            h = cast(HashAlgorithm, hashlib.sha256())
         with open(path, "rb") as fh:
             for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):
                 h.update(chunk)
@@ -284,8 +349,8 @@ def _compare_files(path1: str, path2: str) -> bool:
         return False
 
 
-def _compare_candidate_group(group: List[FileEntry], progress_callback: Optional[Callable[[Any], None]] = None) -> tuple[List[dict], List[FileEntry]]:
-    duplicates: List[dict] = []
+def _compare_candidate_group(group: List[FileEntry], progress_callback: Optional[ProgressCallback] = None) -> tuple[List[DuplicateGroup], List[FileEntry]]:
+    duplicates: List[DuplicateGroup] = []
     remainder: List[FileEntry] = []
     pending = list(group)
 
@@ -321,6 +386,7 @@ def _compute_image_info(entry: FileEntry) -> None:
     if entry.ext not in IMAGE_EXTS:
         return
     try:
+        from PIL import Image
         with Image.open(entry.path) as im:
             entry.width, entry.height = im.size
             if IMAGEHASH_AVAILABLE:
@@ -369,7 +435,7 @@ def _collect_files(paths: List[str], max_paths: int = 6) -> List[FileEntry]:
     return files
 
 
-def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callback: Optional[Callable[[Any], None]] = None, use_fast_hash: bool = False, verify_fast_hash: bool = False, use_direct_compare: bool = False, cache_path: Optional[str] = None) -> List[dict]:
+def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callback: Optional[ProgressCallback] = None, use_fast_hash: bool = False, verify_fast_hash: bool = False, use_direct_compare: bool = False, cache_path: Optional[str] = None) -> List[DuplicateGroup]:
     """Scan given paths and return list of duplicate groups.
 
     Each group is a dict: {'type': 'exact'|'perceptual', 'hash': str|None, 'files': List[FileEntry], 'suggested': int}
@@ -409,7 +475,7 @@ def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callb
         for f in files:
             size_map[f.size].append(f)
 
-        duplicates: List[dict] = []
+        duplicates: List[DuplicateGroup] = []
 
         # Step 1: within each size group do partial->full hashing
         if progress_callback:
