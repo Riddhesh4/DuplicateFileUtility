@@ -2,7 +2,8 @@
 
 Features:
 - Walk up to 6 user-supplied paths and collect files
-- Fast filtering by file size, then partial-hash, then full SHA256
+- Content-based duplicate detection using two-stage hashing
+- Fast preliminary hash (xxhash, fallback CRC32), then deep SHA256
 - Optional perceptual image hashing (imagehash) to detect visually
   identical images even when file bytes differ
 """
@@ -13,9 +14,10 @@ import time
 import hashlib
 import logging
 import sqlite3
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mmap
 from typing import List, Optional, Callable, Dict, Any, TypedDict, Literal, Union, Protocol, cast, TYPE_CHECKING
 
@@ -103,6 +105,7 @@ class HashCache:
                 path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
                 mtime REAL NOT NULL,
+                fast_hash TEXT,
                 partial_hash TEXT,
                 full_hash TEXT,
                 phash TEXT,
@@ -112,7 +115,15 @@ class HashCache:
             )
             """
         )
+        self._ensure_columns()
         self.conn.commit()
+
+    def _ensure_columns(self) -> None:
+        # Keep cache schema compatible with older DB files created before fast_hash existed.
+        cursor = self.conn.execute("PRAGMA table_info(file_hashes)")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "fast_hash" not in cols:
+            self.conn.execute("ALTER TABLE file_hashes ADD COLUMN fast_hash TEXT")
 
     def close(self) -> None:
         try:
@@ -130,17 +141,18 @@ class HashCache:
         for start in range(0, len(paths), batch_size):
             batch = paths[start : start + batch_size]
             placeholders = ",".join("?" for _ in batch)
-            query = "SELECT path,size,mtime,partial_hash,full_hash,phash,width,height FROM file_hashes WHERE path IN (" + placeholders + ")"
+            query = "SELECT path,size,mtime,fast_hash,partial_hash,full_hash,phash,width,height FROM file_hashes WHERE path IN (" + placeholders + ")"
             cursor = self.conn.execute(query, batch)
             for row in cursor.fetchall():
                 records[row[0]] = {
                     "size": row[1],
                     "mtime": row[2],
-                    "partial_hash": row[3],
-                    "full_hash": row[4],
-                    "phash": row[5],
-                    "width": row[6],
-                    "height": row[7],
+                    "fast_hash": row[3],
+                    "partial_hash": row[4],
+                    "full_hash": row[5],
+                    "phash": row[6],
+                    "width": row[7],
+                    "height": row[8],
                 }
         return records
 
@@ -153,11 +165,12 @@ class HashCache:
                 phash_value = None
         self.conn.execute(
             """
-            INSERT INTO file_hashes (path, size, mtime, partial_hash, full_hash, phash, width, height, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO file_hashes (path, size, mtime, fast_hash, partial_hash, full_hash, phash, width, height, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 size=excluded.size,
                 mtime=excluded.mtime,
+                fast_hash=excluded.fast_hash,
                 partial_hash=excluded.partial_hash,
                 full_hash=excluded.full_hash,
                 phash=excluded.phash,
@@ -169,6 +182,7 @@ class HashCache:
                 entry.path,
                 entry.size,
                 entry.mtime,
+                entry.fast_hash,
                 entry.partial_hash,
                 entry.full_hash,
                 phash_value,
@@ -189,6 +203,7 @@ class DuplicateGroup(TypedDict):
 class CacheRecord(TypedDict, total=False):
     size: int
     mtime: float
+    fast_hash: Optional[str]
     partial_hash: Optional[str]
     full_hash: Optional[str]
     phash: Optional[str]
@@ -225,6 +240,7 @@ class FileEntry:
     ext: str
     width: Optional[int] = None
     height: Optional[int] = None
+    fast_hash: Optional[str] = None
     partial_hash: Optional[str] = None
     full_hash: Optional[str] = None
     phash: Optional[object] = None  # imagehash.ImageHash when available
@@ -245,6 +261,7 @@ def _is_image_file(path: str) -> bool:
 def _apply_cache_to_entry(entry: FileEntry, record: CacheRecord) -> None:
     if record.get("size") != entry.size or record.get("mtime") != entry.mtime:
         return
+    entry.fast_hash = record.get("fast_hash")
     entry.partial_hash = record.get("partial_hash")
     entry.full_hash = record.get("full_hash")
     entry.width = record.get("width")
@@ -296,17 +313,21 @@ def _compute_full_hash_worker(path: str) -> Optional[str]:
 
 
 def _compute_fast_hash_worker(path: str) -> Optional[str]:
-    """Compute a fast fingerprint for a file, preferring xxhash when available."""
+    """Compute a fast fingerprint for a file, preferring xxhash with CRC32 fallback."""
     try:
         if XXHASH_AVAILABLE:
             assert XXHASH_AVAILABLE, "xxhash must be available"  # type guard
             h = cast(HashAlgorithm, xxhash.xxh64())
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):
+                    h.update(chunk)
+            return h.hexdigest()
         else:
-            h = cast(HashAlgorithm, hashlib.sha256())
-        with open(path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):
-                h.update(chunk)
-        return h.hexdigest()
+            crc = 0
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(CHUNK_SIZE), b""):
+                    crc = zlib.crc32(chunk, crc)
+            return f"{crc & 0xFFFFFFFF:08x}"
     except Exception:
         return None
 
@@ -435,12 +456,13 @@ def _collect_files(paths: List[str], max_paths: int = 6) -> List[FileEntry]:
     return files
 
 
-def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callback: Optional[ProgressCallback] = None, use_fast_hash: bool = False, verify_fast_hash: bool = False, use_direct_compare: bool = False, cache_path: Optional[str] = None) -> List[DuplicateGroup]:
+def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callback: Optional[ProgressCallback] = None, use_fast_hash: bool = False, verify_fast_hash: bool = False, use_direct_compare: bool = False, cache_path: Optional[str] = None, files: Optional[List[FileEntry]] = None) -> List[DuplicateGroup]:
     """Scan given paths and return list of duplicate groups.
 
     Each group is a dict: {'type': 'exact'|'perceptual', 'hash': str|None, 'files': List[FileEntry], 'suggested': int}
     """
-    files = _collect_files(paths)
+    if files is None:
+        files = _collect_files(paths)
     cache = HashCache(cache_path) if cache_path else None
     try:
         if cache:
@@ -470,143 +492,61 @@ def find_duplicates(paths: List[str], workers: Optional[int] = 4, progress_callb
                     if progress_callback:
                         progress_callback({"type": "status", "text": "Collecting image metadata..."})
 
-        # group by file size (quick filter)
-        size_map = defaultdict(list)
-        for f in files:
-            size_map[f.size].append(f)
-
         duplicates: List[DuplicateGroup] = []
 
-        # Step 1: within each size group do partial->full hashing
+        # Step 1: content hash pass over all files (name/size independent).
         if progress_callback:
-            progress_callback({"type": "status", "text": "Running size/partial/full-hash pass..."})
+            progress_callback({"type": "status", "text": "Computing fast content hashes..."})
 
-        # For determinism in progress reporting, compute total candidate files for hashing
-        candidate_groups = [g for g in size_map.values() if len(g) > 1]
-        total_partial = sum(len(g) for g in candidate_groups)
+        fast_pending = [e for e in files if not e.fast_hash]
         if progress_callback:
-            progress_callback({"type": "total", "total": total_partial})
+            progress_callback({"type": "total", "stage": "fast", "total": len(fast_pending), "text": "Fast hash pass"})
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            # Flatten candidate files (size groups with >1 file)
-            candidate_files = [e for g in candidate_groups for e in g]
+        if fast_pending:
+            with ThreadPoolExecutor(max_workers=max(1, workers or 1)) as ex:
+                fast_futs = {ex.submit(_compute_fast_hash_worker, e.path): e for e in fast_pending}
+                for fut in as_completed(fast_futs):
+                    entry = fast_futs[fut]
+                    try:
+                        entry.fast_hash = fut.result()
+                    except Exception:
+                        entry.fast_hash = None
+                    if progress_callback:
+                        progress_callback({"type": "file", "stage": "fast", "path": entry.path})
 
-            # Partial hashes (fast) for candidate files missing cached values
-            partial_futs = {ex.submit(_compute_partial_hash, e.path): e for e in candidate_files if not e.partial_hash}
-            for fut in as_completed(partial_futs):
-                entry = partial_futs[fut]
-                try:
-                    entry.partial_hash = fut.result()
-                except Exception:
-                    entry.partial_hash = None
-                if progress_callback:
-                    progress_callback({"type": "file", "stage": "partial", "path": entry.path})
+        fast_map: Dict[str, List[FileEntry]] = defaultdict(list)
+        for entry in files:
+            if entry.fast_hash:
+                fast_map[entry.fast_hash].append(entry)
 
-            for entry in candidate_files:
-                if entry.partial_hash is None:
-                    entry.partial_hash = _compute_partial_hash(entry.path)
+        full_candidates = [e for group in fast_map.values() if len(group) > 1 for e in group]
+        if progress_callback:
+            progress_callback({"type": "status", "text": "Verifying duplicate candidates with SHA-256..."})
 
-            # Group by (size, partial_hash) to limit next stages
-            partial_map = defaultdict(list)
-            for e in candidate_files:
-                partial_map[(e.size, e.partial_hash)].append(e)
+        full_pending = [e for e in full_candidates if not e.full_hash]
+        if progress_callback:
+            progress_callback({"type": "total", "stage": "full", "total": len(full_pending), "text": "Deep hash pass"})
 
-            candidate_groups = [g for g in partial_map.values() if len(g) > 1]
-            candidate_files = [e for g in candidate_groups for e in g]
+        if full_pending:
+            with ThreadPoolExecutor(max_workers=max(1, workers or 1)) as ex:
+                full_futs = {ex.submit(_compute_full_hash_worker, e.path): e for e in full_pending}
+                for fut in as_completed(full_futs):
+                    entry = full_futs[fut]
+                    try:
+                        entry.full_hash = fut.result()
+                    except Exception:
+                        entry.full_hash = None
+                    if progress_callback:
+                        progress_callback({"type": "file", "stage": "full", "path": entry.path})
 
-            if use_direct_compare:
-                direct_candidates: List[FileEntry] = []
-                for group in candidate_groups:
-                    if len(group) == 2:
-                        left, right = group
-                        if _compare_files(left.path, right.path):
-                            duplicates.append({"type": "exact", "hash": None, "files": [left, right], "suggested": _suggest_best(group)})
-                        else:
-                            direct_candidates.extend(group)
-                        continue
+        full_map: Dict[str, List[FileEntry]] = defaultdict(list)
+        for entry in full_candidates:
+            if entry.full_hash:
+                full_map[entry.full_hash].append(entry)
 
-                    exact_groups, remainder = _compare_candidate_group(group, progress_callback=progress_callback)
-                    duplicates.extend(exact_groups)
-                    direct_candidates.extend(remainder)
-
-                candidate_files = direct_candidates
-
-            if use_fast_hash and candidate_files:
-                # Compute a fast file fingerprint for candidate files.
-                if progress_callback:
-                    progress_callback({"type": "status", "text": "Computing fast file fingerprints..."})
-                proc_workers = max(1, min(len(candidate_files), workers or 1))
-                with ProcessPoolExecutor(max_workers=proc_workers) as pex:
-                    fast_futs = {pex.submit(_compute_fast_hash_worker, e.path): e for e in candidate_files}
-                    for fut in as_completed(fast_futs):
-                        entry = fast_futs[fut]
-                        try:
-                            entry.fast_hash = fut.result()
-                        except Exception:
-                            entry.fast_hash = None
-                        if progress_callback:
-                            progress_callback({"type": "file", "stage": "fast", "path": entry.path})
-
-                fast_map = defaultdict(list)
-                for e in candidate_files:
-                    fast_map[(e.size, e.partial_hash, e.fast_hash)].append(e)
-
-                if verify_fast_hash:
-                    full_candidates = []
-                    for fkey, fgroup in fast_map.items():
-                        if len(fgroup) < 2:
-                            continue
-                        full_candidates.extend(fgroup)
-                    if full_candidates:
-                        proc_workers = max(1, min(len(full_candidates), workers or 1))
-                        with ProcessPoolExecutor(max_workers=proc_workers) as pex:
-                            full_futs = {pex.submit(_compute_full_hash_worker, e.path): e for e in full_candidates}
-                            for fut in as_completed(full_futs):
-                                entry = full_futs[fut]
-                                try:
-                                    entry.full_hash = fut.result()
-                                except Exception:
-                                    entry.full_hash = None
-                                if progress_callback:
-                                    progress_callback({"type": "file", "stage": "full", "path": entry.path})
-
-                        full_groups = defaultdict(list)
-                        for e in full_candidates:
-                            full_groups[e.full_hash].append(e)
-                        for fh, flist in full_groups.items():
-                            if fh and len(flist) > 1:
-                                duplicates.append({"type": "exact", "hash": fh, "files": flist, "suggested": _suggest_best(flist)})
-                    return duplicates
-                else:
-                    for fh_key, flist in fast_map.items():
-                        if fh_key[2] and len(flist) > 1:
-                            duplicates.append({"type": "exact", "hash": fh_key[2], "files": flist, "suggested": _suggest_best(flist)})
-                    return duplicates
-
-            if candidate_files:
-                # limit processes to available workers but at least 1
-                entries_to_hash = [e for e in candidate_files if not e.full_hash]
-                if entries_to_hash:
-                    proc_workers = max(1, min(len(entries_to_hash), max(1, min(workers or 1, 2))))
-                    with ProcessPoolExecutor(max_workers=proc_workers) as pex:
-                        full_futs = {pex.submit(_compute_full_hash_worker, e.path): e for e in entries_to_hash}
-                        for fut in as_completed(full_futs):
-                            entry = full_futs[fut]
-                            try:
-                                entry.full_hash = fut.result()
-                            except Exception:
-                                entry.full_hash = None
-                            if progress_callback:
-                                progress_callback({"type": "file", "stage": "full", "path": entry.path})
-
-            # Group by full hash -> exact duplicates
-            full_groups = defaultdict(list)
-            for e in candidate_files:
-                full_groups[e.full_hash].append(e)
-
-            for fh, flist in full_groups.items():
-                if fh and len(flist) > 1:
-                    duplicates.append({"type": "exact", "hash": fh, "files": flist, "suggested": _suggest_best(flist)})
+        for full_hash, group in full_map.items():
+            if len(group) > 1:
+                duplicates.append({"type": "exact", "hash": full_hash, "files": group, "suggested": _suggest_best(group)})
 
         # Step 2: perceptual image clustering (images not already in exact groups)
         if IMAGEHASH_AVAILABLE:

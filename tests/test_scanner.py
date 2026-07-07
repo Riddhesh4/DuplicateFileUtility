@@ -26,6 +26,20 @@ def test_find_exact_duplicates(tmp_path):
     assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)
 
 
+def test_detects_duplicates_with_different_extension_and_name(tmp_path):
+    d = tmp_path / "ext"
+    d.mkdir()
+    f1 = d / "Pulsion 2014 Watch Online Video Film1k"
+    f2 = d / "xvideos.com_8161708bedbcddd76cd114f4594c904f.mp4"
+    payload = b"video-bytes" * 1024
+    f1.write_bytes(payload)
+    f2.write_bytes(payload)
+
+    groups = scanner.find_duplicates([str(d)], workers=2)
+
+    assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)
+
+
 def test_no_duplicates(tmp_path):
     d = tmp_path / "c"
     d.mkdir()
@@ -70,20 +84,39 @@ def test_scan_cache_reuse(tmp_path, monkeypatch):
     assert cache_db.exists()
 
     # second scan should reuse cached hashes without recomputing them
-    called = {"partial": 0, "full": 0}
+    called = {"fast": 0, "full": 0}
 
-    def fake_partial(path):
-        called["partial"] += 1
-        return scanner._compute_partial_hash(path)
+    def fake_fast(path):
+        called["fast"] += 1
+        return scanner._compute_fast_hash_worker(path)
 
     def fake_full(path):
         called["full"] += 1
         return scanner._compute_full_hash_worker(path)
 
-    monkeypatch.setattr(scanner, "_compute_partial_hash", fake_partial)
+    monkeypatch.setattr(scanner, "_compute_fast_hash_worker", fake_fast)
     monkeypatch.setattr(scanner, "_compute_full_hash_worker", fake_full)
 
     groups = scanner.find_duplicates([str(d)], workers=1, cache_path=str(cache_db))
     assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)
-    assert called["partial"] == 0
+    assert called["fast"] == 0
     assert called["full"] == 0
+
+
+def test_find_duplicates_reuses_precollected_files(monkeypatch):
+    entry_a = scanner.FileEntry(path=r"D:\A\one.bin", size=5, mtime=1.0, name="one.bin", ext=".bin")
+    entry_b = scanner.FileEntry(path=r"D:\B\two.bin", size=5, mtime=1.0, name="two.bin", ext=".bin")
+    precollected = [entry_a, entry_b]
+
+    def fail_collect(_paths, max_paths=6):
+        raise AssertionError("_collect_files should not run when files are provided")
+
+    monkeypatch.setattr(scanner, "_collect_files", fail_collect)
+    monkeypatch.setattr(scanner, "PIL_AVAILABLE", False)
+    monkeypatch.setattr(scanner, "IMAGEHASH_AVAILABLE", False)
+    monkeypatch.setattr(scanner, "_compute_fast_hash_worker", lambda path: "same-fast")
+    monkeypatch.setattr(scanner, "_compute_full_hash_worker", lambda path: "same-full")
+
+    groups = scanner.find_duplicates([r"D:\A", r"D:\B"], workers=1, files=precollected)
+
+    assert any(g["type"] == "exact" and len(g["files"]) == 2 for g in groups)

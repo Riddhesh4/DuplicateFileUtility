@@ -1,0 +1,4 @@
+Digital signature placeholder:
+1. Build executable with build.bat.
+2. Sign dist\DuplicateFinder\DuplicateFinder.exe with your code-signing certificate.
+3. Re-sign after any post-build resource edits.
