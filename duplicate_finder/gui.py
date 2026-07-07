@@ -113,6 +113,7 @@ class DuplicateFinderWindow(QMainWindow):
         self.scan_worker: Optional[ScanWorker] = None
         self.progress_stage = ""
         self.progress_count = 0
+        self.progress_total = 0
 
         self._build_ui()
         self._create_path_row(0)
@@ -245,8 +246,10 @@ class DuplicateFinderWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #e8f2ff;")
         self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat("Ready")
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress)
 
@@ -353,9 +356,25 @@ class DuplicateFinderWindow(QMainWindow):
         self.results_tree.clear()
         self.progress_stage = ""
         self.progress_count = 0
+        self.progress_total = 0
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat("Ready")
         self.status_label.setText("Ready")
+
+    def _progress_label(self, stage: str) -> str:
+        if stage == "fast":
+            return "Fast hash"
+        if stage == "full":
+            return "Deep hash"
+        return "Scan"
+
+    def _set_progress_text(self) -> None:
+        if self.progress_total > 0:
+            label = self._progress_label(self.progress_stage)
+            self.progress.setFormat(f"{label}: {self.progress_count:,} / {self.progress_total:,}")
+        else:
+            self.progress.setFormat("Preparing scan...")
 
     def start_scan(self):
         if not self.path_rows[0].line_edit.text().strip():
@@ -373,6 +392,7 @@ class DuplicateFinderWindow(QMainWindow):
         self.scan_btn.setEnabled(False)
         self.status_label.setText("Starting scan...")
         self.progress.setRange(0, 0)  # indeterminate until first total arrives
+        self.progress.setFormat("Preparing scan...")
 
         self.scan_worker = ScanWorker(paths)
         self.scan_thread = QThread(self)
@@ -397,8 +417,10 @@ class DuplicateFinderWindow(QMainWindow):
     def _on_total(self, stage: str, total: int, text: str):
         self.progress_stage = stage
         self.progress_count = 0
+        self.progress_total = total
         self.progress.setRange(0, max(1, total))
-        self.progress.setValue(0)
+        self.progress.setValue(0 if total > 0 else 1)
+        self._set_progress_text()
         if text:
             self.status_label.setText(text)
 
@@ -406,6 +428,7 @@ class DuplicateFinderWindow(QMainWindow):
         if not self.progress_stage or stage == self.progress_stage:
             self.progress_count += 1
             self.progress.setValue(self.progress_count)
+            self._set_progress_text()
         name = os.path.basename(path) if path else ""
         if name:
             self.status_label.setText(f"{stage.title()} {name}")
@@ -413,6 +436,10 @@ class DuplicateFinderWindow(QMainWindow):
     def _on_done(self, groups: list):
         self.result_groups = groups
         self._populate_results(groups)
+        if self.progress_total > 0:
+            self.progress_count = self.progress_total
+            self.progress.setValue(self.progress.maximum())
+            self._set_progress_text()
         if groups:
             self.status_label.setText(f"Found {len(groups)} duplicate group(s)")
         else:

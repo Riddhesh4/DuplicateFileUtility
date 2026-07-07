@@ -2,13 +2,13 @@
 
 from pathlib import Path
 
-project_root = Path(__file__).parent.resolve()
+project_root = Path.cwd().resolve()
 icon_path = project_root / "assets" / "app.ico"
 version_file = project_root / "build_assets" / "version_info.txt"
 manifest_file = project_root / "build_assets" / "app.manifest"
 
 a = Analysis(
-    ['duplicate_finder/__main__.py'],
+    ['app_launcher.py'],
     pathex=[str(project_root)],
     binaries=[],
     datas=[

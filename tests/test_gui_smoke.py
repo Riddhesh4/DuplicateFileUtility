@@ -63,3 +63,17 @@ def test_folder_constraints():
     assert len(win.path_rows) == 5
 
     win.close()
+
+
+def test_progress_text_uses_counts_not_stuck_percent():
+    _ = _app()
+    win = gui.DuplicateFinderWindow()
+
+    win._on_total("fast", 2000, "Fast hash pass")
+    win._on_file_progress("fast", r"D:\A\video1.mp4")
+    win._on_file_progress("fast", r"D:\A\video2.mp4")
+
+    assert win.progress.format() == "Fast hash: 2 / 2,000"
+    assert win.progress.value() == 2
+
+    win.close()

@@ -15,6 +15,7 @@ env/
 # Test and build
 .pytest_cache/
 .build/
+build/
 dist/
 
 # Playwright / reports
